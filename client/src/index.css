@@ -1,0 +1,78 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  /* Aurora mesh: soft teal/violet glows over the deep ink base, fixed so it
+     doesn't scroll with content — this is what gives the glass cards below
+     something to actually look "frosted" against. */
+  background-color: theme("colors.ink.900");
+  background-image: theme("backgroundImage.aurora-mesh");
+  background-attachment: fixed;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: theme("colors.ink.600");
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: theme("colors.brand.700");
+}
+
+/* ---- Glass design system ---- */
+/* Every page already composes these shared classes (.card, .btn-primary,
+   .btn-secondary, .input, .label, .badge), so re-theming them here
+   repaints the whole app consistently without touching individual pages. */
+
+.card {
+  @apply relative rounded-2xl border border-white/10 bg-white/[0.04] backdrop-blur-xl shadow-glass;
+}
+.card::before {
+  /* Faint top highlight — the classic "light hitting glass" edge. */
+  content: "";
+  @apply pointer-events-none absolute inset-0 rounded-2xl shadow-glass-inset;
+}
+
+.glass-panel {
+  @apply rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl;
+}
+
+.btn-primary {
+  @apply bg-aurora-line text-white font-medium px-4 py-2 rounded-lg transition-all duration-200
+    shadow-glow hover:brightness-110 hover:shadow-[0_0_32px_0_rgba(139,92,246,0.35)]
+    disabled:opacity-50 disabled:cursor-not-allowed disabled:shadow-none;
+  background-image: theme("backgroundImage.aurora-line");
+}
+
+.btn-secondary {
+  @apply bg-white/[0.06] hover:bg-white/[0.1] border border-white/10 text-slate-100 font-medium px-4 py-2 rounded-lg backdrop-blur-md transition-colors disabled:opacity-50;
+}
+
+.input {
+  @apply bg-white/[0.03] border border-white/10 rounded-lg px-3 py-2 text-sm w-full backdrop-blur-md
+    focus:outline-none focus:ring-2 focus:ring-brand-500/60 focus:border-brand-500/50
+    placeholder:text-slate-500 transition-colors;
+}
+
+.label {
+  @apply text-xs uppercase tracking-wide text-slate-400 mb-1 block;
+}
+
+.badge {
+  @apply text-xs px-2 py-0.5 rounded-full font-medium border border-white/10 bg-white/[0.05] backdrop-blur-sm;
+}
+
+/* Thin gradient rule, handy for section dividers / brand accents. */
+.aurora-divider {
+  height: 1px;
+  background-image: theme("backgroundImage.aurora-line");
+  opacity: 0.35;
+}

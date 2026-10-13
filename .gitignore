@@ -1,0 +1,43 @@
+# ---- Secrets: never commit these ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+service-account*.json
+
+# ---- Dependencies and build output ----
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# ---- Python (stt-service) ----
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# ---- Local speech models and caches (several GB; downloaded on first start) ----
+stt-service/models/
+**/model.bin
+*.safetensors
+*.gguf
+.cache/
+huggingface/
+
+# ---- Runtime data: uploaded recordings can contain private conversations ----
+server/uploads/*
+!server/uploads/.gitkeep
+logs/
+*.log
+npm-debug.log*
+
+# ---- Test output, editor and OS files ----
+coverage/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
