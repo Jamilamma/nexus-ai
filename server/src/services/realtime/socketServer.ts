@@ -1,12 +1,12 @@
 import { Server as HttpServer } from "http";
 import { Server as SocketIOServer, Socket } from "socket.io";
 import { Types } from "mongoose";
-import { verifyToken } from "../utils/jwt";
-import { env } from "../config/env";
-import { LiveSession, LiveSessionMode } from "../models/LiveSession";
-import { Meeting, IMeeting } from "../models/Meeting";
-import { User } from "../models/User";
-import { answerFromRecording } from "../services/rag/retrieve";
+import { verifyToken } from "../../utils/jwt";
+import { env } from "../../config/env";
+import { LiveSession, LiveSessionMode } from "../../models/LiveSession";
+import { Meeting, IMeeting } from "../../models/Meeting";
+import { User } from "../../models/User";
+import { answerFromRecording } from "../rag/retrieve";
 import {
   createLiveSession,
   pushAudioChunk,
@@ -15,8 +15,8 @@ import {
   changeOutputLanguage,
   endLiveSession,
   getRecordingId,
-} from "../services/realtime/sessionManager";
-import { addParticipant, markParticipantLeft, MeetingAccessError } from "../services/meeting/access";
+} from "./sessionManager";
+import { addParticipant, markParticipantLeft, MeetingAccessError } from "../meeting/access";
 import {
   ensureMeetingSessionStarted,
   detachParticipantAudio,
@@ -25,9 +25,14 @@ import {
   askAboutMeeting,
   endMeetingSession,
   isMeetingActive,
+  getMeetingRecordingId,
   generateLiveMeetingSummary,
   MeetingAiError,
-} from "../services/realtime/meetingManager";
+  setTranslationTarget,
+  clearTranslationTarget,
+  setSpokenLanguages,
+} from "./meetingManager";
+import { isSupportedTranslationLanguage } from "../ai/translateSegments";
 import {
   addSocket,
   removeSocket,
@@ -39,9 +44,9 @@ import {
   getChat,
   clearRoom,
   MAX_CHAT_LENGTH,
-} from "../services/meeting/roomState";
-import { closeLiveKitRoom } from "../services/video/livekit";
-import { startMeetingTranscriber, stopMeetingTranscriber } from "../services/video/livekitTranscriber";
+} from "../meeting/roomState";
+import { closeLiveKitRoom } from "../video/livekit";
+import { startMeetingTranscriber, stopMeetingTranscriber } from "../video/livekitTranscriber";
 
 interface AuthedSocket extends Socket {
   userId?: Types.ObjectId;
@@ -54,6 +59,20 @@ interface AuthedSocket extends Socket {
  * requireAuth for REST routes (Express middleware doesn't apply to the
  * socket handshake automatically, so this re-implements that check).
  */
+/** Resolves with the promise's value, or undefined if it fails or takes longer than `ms` (logged, never thrown). */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T | undefined> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      console.warn(`[meeting] ${label} did not finish within ${ms} ms; continuing`);
+      resolve(undefined);
+    }, ms);
+    promise.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (err) => { clearTimeout(timer); console.warn(`[meeting] ${label} failed: ${err?.message || err}`); resolve(undefined); }
+    );
+  });
+}
+
 export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
   const io = new SocketIOServer(httpServer, {
     cors: { origin: env.clientUrl, credentials: true },
@@ -64,8 +83,11 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
 
   // Meetings that have been ended by this process (short-lived; blocks late rejoins / stale grace timers).
   const closedMeetings = new Set<string>();
+  // Meetings currently being ended. A second "End" click (or the last person leaving at the same moment)
+  // joins the same job instead of being ignored, and a failed attempt can be retried.
+  const closingJobs = new Map<string, Promise<{ recordingId?: string }>>();
 
-  realtime.use((socket: AuthedSocket, next) => {
+  realtime.use((socket: AuthedSocket, next: (err?: Error) => void) => {
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error("Authentication required."));
     try {
@@ -93,12 +115,12 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
             mode || "general_meeting",
             outputLanguage || "English",
             {
-              onTranscriptPartial: (text) => socket.emit("transcript_partial", { text }),
-              onTranscriptFinal: (segment) => socket.emit("transcript_final", { segment }),
-              onTranslationUpdate: (segmentIndex, translatedText, detectedLanguage) =>
+              onTranscriptPartial: (text: any) => socket.emit("transcript_partial", { text }),
+              onTranscriptFinal: (segment: any) => socket.emit("transcript_final", { segment }),
+              onTranslationUpdate: (segmentIndex: any, translatedText: any, detectedLanguage: any) =>
                 socket.emit("translation_update", { segmentIndex, translatedText, detectedLanguage }),
-              onInsightUpdate: (state) => socket.emit("ai_insight", state),
-              onError: (message) => socket.emit("error", { message }),
+              onInsightUpdate: (state: any) => socket.emit("ai_insight", state),
+              onError: (message: any) => socket.emit("error", { message }),
             }
           );
 
@@ -195,8 +217,8 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
       // currently connected (so stale rows after a crash never show up).
       const present = new Set(presentUserIds(meetingId));
       const participants = meeting.participants
-        .filter((p) => present.has(p.userId.toString()))
-        .map((p) => ({
+        .filter((p: any) => present.has(p.userId.toString()))
+        .map((p: any) => ({
           userId: p.userId.toString(),
           displayName: p.displayName,
           preferredLanguage: p.preferredLanguage,
@@ -269,12 +291,16 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
             const roomName = roomOf(meetingId);
             try {
               recordingId = await ensureMeetingSessionStarted(meetingId, meeting.hostId, meeting.title, meeting.mode, {
-                onTranscriptPartial: (partial) => realtime.to(roomName).emit("meeting_transcript_partial", partial),
-                onTranscriptFinal: (segment) => realtime.to(roomName).emit("meeting_transcript_final", { segment }),
-                onTranslationUpdate: (segmentId, language, translatedText, detectedLanguage) =>
+                onTranscriptPartial: (partial: any) =>
+                  realtime.to(roomName).emit("meeting_transcript_partial", partial),
+                onTranscriptFinal: (segment: any) =>
+                  realtime.to(roomName).emit("meeting_transcript_final", { segment }),
+                onTranslationUpdate: (segmentId: any, language: any, translatedText: any, detectedLanguage: any) =>
                   realtime.to(roomName).emit("meeting_translation_update", { segmentId, language, translatedText, detectedLanguage }),
-                onInsightUpdate: (state) => realtime.to(roomName).emit("meeting_insight", state),
-                onError: (userId, message) => realtime.to(roomName).emit("meeting_error", { userId, message, code: "TRANSCRIPTION" }),
+                onInsightUpdate: (state: any) =>
+                  realtime.to(roomName).emit("meeting_insight", state),
+                onError: (userId: any, message: any) =>
+                  realtime.to(roomName).emit("meeting_error", { userId, message, code: "TRANSCRIPTION" }),
               });
               // Idempotent: a rejoin/reconnect reuses the existing subscriber, so no duplicate stream.
               await startMeetingTranscriber(meetingId);
@@ -349,6 +375,35 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
       );
     });
 
+    // ---- Transcript reading aids -------------------------------------------
+    // Translation target: which language this user wants to READ the transcript in (null = original
+    // only). Translations are stored beside the original text and never replace it. Cost control:
+    // nothing is translated for a language nobody has asked for.
+    socket.on("meeting_set_translation", (payload: { language?: string | null }) => {
+      const meetingId = socket.data.meetingId;
+      if (!meetingId || !socket.userId || !env.transcriptionActive) return;
+      const language = payload?.language == null ? null : String(payload.language);
+      if (language !== null && !isSupportedTranslationLanguage(language)) {
+        return socket.emit("meeting_error", { message: `Translation into "${language}" isn't supported.`, code: "BAD_LANGUAGE" });
+      }
+      if (aiRateLimited("translationSetTimes", 12, 30_000)) return;
+      try {
+        setTranslationTarget(meetingId, socket.userId.toString(), language);
+      } catch (err: any) {
+        socket.emit("meeting_error", { message: err?.message || "Couldn't start translation.", code: "TRANSLATION" });
+      }
+    });
+
+    // Optional "I speak" hint for THIS user's microphone (ISO codes en/ta/hi/ar). It only biases
+    // recognition; an empty list returns to automatic language detection.
+    socket.on("meeting_set_spoken_languages", (payload: { languages?: string[] }) => {
+      const meetingId = socket.data.meetingId;
+      if (!meetingId || !socket.userId || !env.transcriptionActive) return;
+      if (aiRateLimited("spokenSetTimes", 6, 30_000)) return;
+      const languages = Array.isArray(payload?.languages) ? payload.languages.slice(0, 4).map(String) : [];
+      setSpokenLanguages(meetingId, socket.userId.toString(), languages);
+    });
+
     // ---- NEXUS AI (Summary + Ask NEXUS) ------------------------------------
     // Both are PRIVATE replies: emitted only to the socket that asked, never
     // to the meeting room. Errors use a dedicated event so the panel can show
@@ -396,6 +451,8 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
           askedBy: socket.data.meetingDisplayName,
           answer: result.answer,
           sources: result.sources,
+          segmentCount: result.segmentCount,
+          timings: result.timings,
         });
       } catch (err: any) {
         emitAiError("ask", requestId, err?.message || "Couldn't answer that right now.", "FAILED");
@@ -423,18 +480,34 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
     });
 
     // ---- End / leave -----------------------------------------------------
-    socket.on("end_meeting", async () => {
+    // Host only. The client passes an acknowledgement callback so it can show "ending..." and real errors; older
+    // clients that send no callback still get a `meeting_error` event.
+    socket.on("end_meeting", async (...args: any[]) => {
+      const ack = [...args].reverse().find((a: any) => typeof a === "function") as
+        | ((res: { ok: boolean; code?: string; message?: string; recordingId?: string; alreadyEnded?: boolean }) => void)
+        | undefined;
+      const fail = (code: string, message: string) => {
+        if (ack) ack({ ok: false, code, message });
+        else socket.emit("meeting_error", { message, code });
+      };
       try {
-        const meetingId = socket.data.meetingId;
-        if (!meetingId || !socket.userId) return;
-        const meeting = await Meeting.findById(meetingId);
-        if (!meeting) return;
+        const meetingId = socket.data.meetingId as string | undefined;
+        if (!meetingId || !socket.userId) return fail("NOT_JOINED", "You are not in this meeting.");
+        const meeting = await Meeting.findById(meetingId).select("hostId status");
+        if (!meeting) return fail("NOT_FOUND", "This meeting no longer exists.");
         if (!meeting.hostId.equals(socket.userId)) {
-          return socket.emit("meeting_error", { message: "Only the host can end the meeting for everyone.", code: "NOT_HOST" });
+          return fail("NOT_HOST", "Only the host can end the meeting for everyone.");
         }
-        await closeMeeting(meetingId);
+        if (meeting.status === "ended" && !closingJobs.has(meetingId)) {
+          // Already ended (e.g. a double click that raced the first one): confirm instead of staying silent.
+          ack?.({ ok: true, alreadyEnded: true });
+          return;
+        }
+        const { recordingId } = await closeMeeting(meetingId);
+        ack?.({ ok: true, recordingId });
       } catch (err: any) {
-        socket.emit("meeting_error", { message: err.message });
+        console.error(`[meeting] end_meeting failed: ${err?.message || err}`);
+        fail("FAILED", "Couldn't end the meeting. Please try again.");
       }
     });
 
@@ -480,6 +553,7 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
       if (isUserPresent(meetingId, userId.toString())) return; // they came back in the meantime
       if (env.transcriptionActive) {
         try {
+          clearTranslationTarget(meetingId, userId.toString());
           detachParticipantAudio(meetingId, userId.toString());
         } catch {
           /* AI is optional */
@@ -494,34 +568,69 @@ export function attachRealtimeServer(httpServer: HttpServer): SocketIOServer {
       }
     }
 
-    /** Single place a meeting ends — host action, or the last person leaving. */
-    async function closeMeeting(meetingId: string): Promise<Types.ObjectId | null> {
-      if (closedMeetings.has(meetingId)) return null;
-      closedMeetings.add(meetingId);
-      setTimeout(() => closedMeetings.delete(meetingId), 10 * 60 * 1000).unref();
+    /**
+     * Single place a meeting ends — host action, or the last person leaving.
+     *
+     * Order matters: everyone is told the meeting is over as soon as it is marked ended in MongoDB. The slow
+     * parts (letting Whisper finish the last sentence, building the AI report — a Gemini call that can take
+     * a minute) run afterwards in the background; the report page shows "processing" until they finish.
+     * Calling it again while it runs returns the same job; if it fails it can be called again.
+     */
+    function closeMeeting(meetingId: string): Promise<{ recordingId?: string }> {
+      const existing = closingJobs.get(meetingId);
+      if (existing) return existing;
 
-      // Stop pulling audio first so no new STT input arrives while finalizing.
-      await stopMeetingTranscriber(meetingId).catch(() => {});
+      const job = (async () => {
+        const startedAt = Date.now();
+        closedMeetings.add(meetingId); // blocks late re-joins and stale grace timers
+        const recordingId = getMeetingRecordingId(meetingId)?.toString();
 
-      let recordingId: Types.ObjectId | null = null;
-      if (isMeetingActive(meetingId)) {
-        recordingId = await endMeetingSession(meetingId).catch(() => null);
-      }
+        // 1. Stop pulling audio (bounded: the LiveKit connection may be unhealthy).
+        await withTimeout(stopMeetingTranscriber(meetingId), 5_000, "stop transcriber");
 
-      const now = new Date();
-      await Meeting.updateOne({ _id: meetingId, status: { $ne: "ended" } }, { $set: { status: "ended", endedAt: now } });
-      await Meeting.updateOne(
-        { _id: meetingId },
-        { $set: { "participants.$[p].leftAt": now } },
-        { arrayFilters: [{ "p.leftAt": null }] }
+        // 2. Persist the ended state. This is the one step that must succeed.
+        const now = new Date();
+        await Meeting.updateOne({ _id: meetingId, status: { $ne: "ended" } }, { $set: { status: "ended", endedAt: now } });
+        await Meeting.updateOne(
+          { _id: meetingId },
+          { $set: { "participants.$[p].leftAt": now } },
+          { arrayFilters: [{ "p.leftAt": null }] }
+        );
+
+        // 3. Tell everyone, now.
+        const room = roomOf(meetingId);
+        realtime.to(room).emit("meeting_ended", { recordingId });
+        realtime.in(room).socketsLeave(room);
+        clearRoom(meetingId);
+        console.log(`[meeting] ${meetingId} ended, participants notified after ${Date.now() - startedAt} ms`);
+
+        // 4. Close the LiveKit room (drops any media connection that is still open; failure is non-fatal).
+        await withTimeout(closeLiveKitRoom(meetingId), 5_000, "close LiveKit room");
+
+        // 5. Slow work in the background: flush the last spoken sentences, save the transcript, build the report.
+        void (async () => {
+          try {
+            if (isMeetingActive(meetingId)) await endMeetingSession(meetingId);
+            console.log(`[meeting] ${meetingId} finalized after ${Date.now() - startedAt} ms`);
+          } catch (err: any) {
+            console.error(`[meeting] finalizing ${meetingId} failed: ${err?.message || err}`);
+          }
+        })();
+
+        return { recordingId };
+      })();
+
+      closingJobs.set(meetingId, job);
+      job.then(
+        () => setTimeout(() => { closingJobs.delete(meetingId); closedMeetings.delete(meetingId); }, 10 * 60 * 1000).unref(),
+        (err: any) => {
+          // Not ended after all: allow the host to try again instead of leaving the meeting stuck "active".
+          console.error(`[meeting] ending ${meetingId} failed: ${err?.message || err}`);
+          closingJobs.delete(meetingId);
+          closedMeetings.delete(meetingId);
+        }
       );
-
-      const room = roomOf(meetingId);
-      realtime.to(room).emit("meeting_ended", { recordingId: recordingId?.toString() });
-      realtime.in(room).socketsLeave(room);
-      clearRoom(meetingId);
-      await closeLiveKitRoom(meetingId);
-      return recordingId;
+      return job;
     }
   });
 
