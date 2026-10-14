@@ -1,6 +1,9 @@
-
 {
   "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://nexus-ai-server-qddr.onrender.com/api/:path*"
+    },
     {
       "source": "/(.*)",
       "destination": "/index.html"
